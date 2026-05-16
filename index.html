@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ADB Toolbox</title>
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      body {
+        margin: 0; padding: 14px;
+        background-color: #1e1e1e; color: #d4d4d4;
+        font-family: system-ui, -apple-system, sans-serif;
+        font-size: 13px;
+        display: flex; flex-direction: column;
+        height: 100vh; overflow: hidden;
+      }
+
+      /* ── Status Header ────────────────────────────────────── */
+      .status-header {
+        background: #252526; border: 1px solid #3c3c3c;
+        padding: 10px 14px; margin-bottom: 12px; border-radius: 4px;
+        display: flex; justify-content: space-between; align-items: center;
+        flex-shrink: 0;
+      }
+      .status-header .info { display: flex; flex-direction: column; gap: 2px; }
+      .status-header h2 { margin: 0; font-size: 1rem; font-weight: 600; color: #e0e0e0; }
+      .status-header p { margin: 0; font-size: 0.78rem; color: #888; font-family: monospace; }
+      .status-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+      .status-dot.connected { background: #4ec956; box-shadow: 0 0 6px #4ec95688; }
+      .status-dot.disconnected { background: #f44; box-shadow: 0 0 6px #f4444488; }
+      #refreshDevicesBtn {
+        background: #333; border: 1px solid #555; color: #ccc; padding: 4px 10px;
+        border-radius: 3px; cursor: pointer; font-size: 0.75rem; margin-left: 10px;
+      }
+      #refreshDevicesBtn:hover { background: #444; }
+
+      /* ── Button Matrix ─────────────────────────────────────── */
+      .matrix-container {
+        display: grid; grid-template-columns: repeat(3, 1fr);
+        gap: 12px; align-items: start; flex-shrink: 0;
+      }
+      .matrix-column {
+        background: #252526; border: 1px solid #3c3c3c;
+        border-radius: 4px; padding: 10px;
+        display: flex; flex-direction: column; gap: 6px;
+      }
+      .column-title { margin: 0 0 1px 0; font-size: 0.88rem; font-weight: 600; color: #e0e0e0; }
+      .column-subtitle {
+        margin: 0 0 8px 0; font-style: italic; font-size: 0.7rem; color: #777;
+        border-bottom: 1px solid #3c3c3c; padding-bottom: 5px;
+      }
+      .cmd-btn {
+        background: #2d2d2d; color: #d4d4d4; border: 1px solid #4a4a4a;
+        border-radius: 3px; padding: 7px 10px; font-size: 0.78rem; text-align: left;
+        cursor: pointer; transition: background 0.15s, border-color 0.15s;
+      }
+      .cmd-btn:hover { background: #383838; border-color: #0078d4; color: #fff; }
+      .cmd-btn:active { background: #0078d4; }
+      .cmd-btn.danger { border-color: #6e3030; }
+      .cmd-btn.danger:hover { background: #4a1c1c; border-color: #d44; color: #fcc; }
+      .group-label {
+        font-size: 0.72rem; font-weight: 600; color: #888;
+        margin-top: 8px; margin-bottom: 1px;
+        text-transform: uppercase; letter-spacing: 0.5px;
+      }
+
+      /* ── Log Panel ──────────────────────────────────────────── */
+      .log-section {
+        margin-top: 12px; flex: 1; display: flex; flex-direction: column;
+        min-height: 0;
+      }
+      .log-header {
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 6px 10px; background: #252526; border: 1px solid #3c3c3c;
+        border-bottom: none; border-radius: 4px 4px 0 0;
+      }
+      .log-header span { font-size: 0.78rem; font-weight: 600; color: #888; text-transform: uppercase; letter-spacing: 0.5px; }
+      #clearLogBtn {
+        background: #333; border: 1px solid #555; color: #999; padding: 2px 8px;
+        border-radius: 3px; cursor: pointer; font-size: 0.7rem;
+      }
+      #clearLogBtn:hover { color: #fff; background: #444; }
+      #logOutput {
+        flex: 1; min-height: 0;
+        background: #0e0e0e; border: 1px solid #3c3c3c;
+        border-radius: 0 0 4px 4px; padding: 8px 10px;
+        font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+        font-size: 0.78rem; line-height: 1.5;
+        overflow-y: auto; white-space: pre-wrap; word-break: break-all;
+        color: #b0b0b0;
+      }
+      .log-ok { color: #4ec956; }
+      .log-err { color: #f44; }
+      .log-info { color: #569cd6; }
+      .log-warn { color: #d7ba7d; }
+      .log-dim { color: #666; }
+
+      /* ── Modal Overlay ──────────────────────────────────────── */
+      .modal-overlay {
+        position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+        background: rgba(0,0,0,0.78); display: flex;
+        justify-content: center; align-items: center; z-index: 2000;
+      }
+      .modal-box {
+        background: #252526; color: #d4d4d4; border: 1px solid #555;
+        width: 540px; max-width: 95vw; border-radius: 6px; padding: 20px;
+        box-shadow: 0 8px 30px rgba(0,0,0,0.6);
+      }
+      .modal-title { font-weight: 600; font-size: 0.95rem; margin-bottom: 12px; color: #fff; }
+      .modal-input {
+        width: 100%; padding: 8px 10px; background: #1e1e1e; color: #e0e0e0;
+        border: 1px solid #555; border-radius: 3px; box-sizing: border-box;
+        font-family: monospace; font-size: 0.82rem; margin-bottom: 10px;
+      }
+      .modal-input:focus { outline: none; border-color: #0078d4; }
+      .modal-textarea {
+        width: 100%; min-height: 100px; padding: 8px 10px;
+        background: #1e1e1e; color: #e0e0e0; border: 1px solid #555;
+        border-radius: 3px; font-family: monospace; font-size: 0.82rem;
+        resize: vertical; box-sizing: border-box; margin-bottom: 10px;
+      }
+      .modal-textarea:focus { outline: none; border-color: #0078d4; }
+      .modal-list {
+        list-style: none; padding: 0; margin: 0; max-height: 220px;
+        overflow-y: auto; border: 1px solid #3c3c3c; background: #1e1e1e; border-radius: 3px;
+      }
+      .modal-row {
+        padding: 7px 10px; cursor: pointer; border-bottom: 1px solid #2a2a2a;
+        font-family: monospace; font-size: 0.8rem; color: #d4d4d4;
+      }
+      .modal-row:hover { background: #333; color: #fff; }
+      .modal-row.selected { background: #0078d4 !important; color: #fff; }
+      .modal-footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+      .modal-footer .status-text {
+        margin-right: auto; font-size: 0.75rem; color: #888; align-self: center;
+      }
+      .mbtn {
+        padding: 5px 14px; border-radius: 3px; cursor: pointer;
+        border: none; font-weight: 600; font-size: 0.8rem;
+      }
+      .mbtn-cancel { background: #3c3c3c; color: #ccc; }
+      .mbtn-cancel:hover { background: #4a4a4a; }
+      .mbtn-ok { background: #0078d4; color: #fff; }
+      .mbtn-ok:hover { background: #1a8ae6; }
+      .mbtn-danger { background: #8b2020; color: #fff; }
+      .mbtn-danger:hover { background: #a52a2a; }
+      .invisible { display: none !important; }
+    </style>
+  </head>
+  <body>
+
+    <!-- ── Status Header ─────────────────────────────────────── -->
+    <div class="status-header">
+      <div class="info">
+        <h2 id="deviceTitle">ADB Toolbox — Detecting devices...</h2>
+        <p id="deviceDetail">Mount: /home/loufogle/mount_point</p>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <div id="statusDot" class="status-dot disconnected"></div>
+        <button id="refreshDevicesBtn">Refresh</button>
+      </div>
+    </div>
+
+    <!-- ── Button Matrix ─────────────────────────────────────── -->
+    <div class="matrix-container">
+
+      <div class="matrix-column">
+        <div class="column-title">App & Payload Control</div>
+        <div class="column-subtitle">Deploy binaries & manage runtime data</div>
+        <button id="push-file-btn" class="cmd-btn">Push File to Device</button>
+        <button id="pull-file-btn" class="cmd-btn">Pull File from Device</button>
+        <button id="install-apk-btn" class="cmd-btn">Install APK</button>
+        <button id="batch-apk-btn" class="cmd-btn">Batch Install APK Directory</button>
+        <button id="purge-cache-btn" class="cmd-btn">Purge App Cache</button>
+        <div class="group-label">Google Play Store Pipeline</div>
+        <button id="fetch-apk-btn" class="cmd-btn">Search & Fetch APK</button>
+        <button id="stream-apk-btn" class="cmd-btn">Search & Stream to Device</button>
+      </div>
+
+      <div class="matrix-column">
+        <div class="column-title">Diagnostics & Interaction</div>
+        <div class="column-subtitle">Debug states & simulate interactions</div>
+        <button id="inject-macro-btn" class="cmd-btn">Inject Text Macros</button>
+        <button id="open-logcat-btn" class="cmd-btn">Logcat Snapshot (200 lines)</button>
+        <button id="capture-screen-btn" class="cmd-btn">Capture Screenshot</button>
+        <button id="record-screen-btn" class="cmd-btn">Record Screen (10s)</button>
+      </div>
+
+      <div class="matrix-column">
+        <div class="column-title">Host Storage & Machine Control</div>
+        <div class="column-subtitle">Direct storage & hardware control</div>
+        <div class="group-label" style="margin-top:0;">Mounted Image</div>
+        <button id="copy-image-btn" class="cmd-btn">Copy File to SD Image</button>
+        <div class="group-label">Device State</div>
+        <button id="restart-framework-btn" class="cmd-btn danger">Restart UI Framework (su)</button>
+        <button id="bootloader-btn" class="cmd-btn danger">Reboot → Bootloader</button>
+        <button id="recovery-btn" class="cmd-btn danger">Reboot → Recovery</button>
+      </div>
+
+    </div>
+
+    <!-- ── Log Output Panel ──────────────────────────────────── -->
+    <div class="log-section">
+      <div class="log-header">
+        <span>Output Log</span>
+        <button id="clearLogBtn">Clear</button>
+      </div>
+      <div id="logOutput"></div>
+    </div>
+
+    <!-- ── Play Store Search Modal ────────────────────────────── -->
+    <div id="pipelinePickerModal" class="modal-overlay invisible">
+      <div class="modal-box">
+        <div id="modalHeadline" class="modal-title">Play Store Search</div>
+        <input type="text" id="modalFilter" class="modal-input" placeholder="Search term → press Enter" />
+        <ul id="modalDataContainer" class="modal-list"></ul>
+        <div class="modal-footer">
+          <span id="modalMetaStatus" class="status-text">Ready.</span>
+          <button id="btnCancelPicker" class="mbtn mbtn-cancel">Cancel</button>
+          <button id="btnConfirmPicker" class="mbtn mbtn-ok">Select</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Generic Input Modal ────────────────────────────────── -->
+    <div id="inputModal" class="modal-overlay invisible">
+      <div class="modal-box">
+        <div id="inputModalTitle" class="modal-title">Input</div>
+        <div id="inputModalBody"></div>
+        <div class="modal-footer">
+          <button id="inputModalCancel" class="mbtn mbtn-cancel">Cancel</button>
+          <button id="inputModalOk" class="mbtn mbtn-ok">OK</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Confirm Modal ─────────────────────────────────────── -->
+    <div id="confirmModal" class="modal-overlay invisible">
+      <div class="modal-box">
+        <div id="confirmModalTitle" class="modal-title">Confirm</div>
+        <p id="confirmModalMsg" style="margin:0 0 4px 0;font-size:0.85rem;"></p>
+        <div class="modal-footer">
+          <button id="confirmModalCancel" class="mbtn mbtn-cancel">Cancel</button>
+          <button id="confirmModalOk" class="mbtn mbtn-danger">Confirm</button>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
