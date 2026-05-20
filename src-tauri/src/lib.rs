@@ -4,48 +4,24 @@ use std::process::Command;
 
 #[tauri::command]
 async fn search_play_store(query: String) -> Result<Vec<String>, String> {
-    let output = Command::new("gplaycli")
-        .args(["-s", &query])
+    let output = Command::new("/home/loufogle/.local/bin/apksearch")
+        .arg(&query)
         .output()
-        .map_err(|e| format!("Failed to run gplaycli: {}", e))?;
+        .map_err(|e| format!("Failed to run apksearch: {}", e))?;
 
     if !output.status.success() {
-        return Err(format!(
-            "gplaycli error: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
+        return Err(format!("apksearch error: {}", String::from_utf8_lossy(&output.stderr)));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let lines: Vec<&str> = stdout.lines().collect();
-
-    if lines.len() < 2 {
-        return Ok(vec![]);
-    }
-
-    // gplaycli outputs a space-padded table with columns:
-    // Title | Creator | Size | Downloads | Last Update | AppID | Version | Rating
-    // Parse column positions from the header row.
-    let header = lines[0];
-    let creator_start = header.find("Creator").unwrap_or(0);
-    let appid_start = match header.find("AppID") {
-        Some(pos) => pos,
-        None => return Err("Unexpected gplaycli output format".into()),
-    };
-    let version_start = header.find("Version").unwrap_or(header.len());
-
-    let mut results = Vec::new();
-    for line in &lines[1..] {
-        if line.len() <= appid_start {
-            continue;
-        }
-        let title = line.get(..creator_start).unwrap_or("").trim();
-        let end = version_start.min(line.len());
-        let appid = line.get(appid_start..end).unwrap_or("").trim();
-        if !appid.is_empty() && !title.is_empty() {
-            results.push(format!("{}  [{}]", title, appid));
-        }
-    }
+    
+    // Robust parsing: collect lines, remove empty ones, and format
+    let results: Vec<String> = stdout
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .map(|line| format!("{} [{}]", line, line)) // Wrap in brackets for regex
+        .collect();
 
     Ok(results)
 }
@@ -54,10 +30,11 @@ async fn search_play_store(query: String) -> Result<Vec<String>, String> {
 async fn download_apk(package_id: String, folder: String) -> Result<String, String> {
     let _ = std::fs::create_dir_all(&folder);
 
-    let output = Command::new("gplaycli")
-        .args(["-d", &package_id, "-f", &folder])
+    // apkeep -a <PACKAGE_ID> -d apk-pure <FOLDER_PATH>
+    let output = Command::new("apkeep")
+        .args(["-a", &package_id, "-d", "apk-pure", &folder])
         .output()
-        .map_err(|e| format!("Failed to run gplaycli: {}", e))?;
+        .map_err(|e| format!("Failed to run apkeep: {}", e))?;
 
     if output.status.success() {
         Ok(format!("Downloaded {} to {}", package_id, folder))
@@ -74,9 +51,9 @@ async fn execute_stream_pipeline(package_id: String) -> Result<String, String> {
     let tmp_dir = "/tmp/gplay_stream_cache";
     let _ = std::fs::create_dir_all(tmp_dir);
 
-    // Download APK to staging cache
-    let dl = Command::new("gplaycli")
-        .args(["-d", &package_id, "-f", tmp_dir])
+    // Download APK to staging cache via apkeep
+    let dl = Command::new("apkeep")
+        .args(["-a", &package_id, "-d", "apk-pure", tmp_dir])
         .output()
         .map_err(|e| format!("Download error: {}", e))?;
 
@@ -117,6 +94,28 @@ async fn execute_stream_pipeline(package_id: String) -> Result<String, String> {
 }
 
 // ── File Transfer ───────────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn list_android_files(remote_path: String) -> Result<Vec<String>, String> {
+    let output = Command::new("adb")
+        .args(["shell", "ls", "-1", &remote_path])
+        .output()
+        .map_err(|e| format!("ADB error: {}", e))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "Failed to list files: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let files = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|s| s.to_string())
+        .collect();
+
+    Ok(files)
+}
 
 #[tauri::command]
 async fn push_file(local_path: String, remote_path: String) -> Result<String, String> {
@@ -326,7 +325,6 @@ async fn capture_screenshot(save_path: String) -> Result<String, String> {
 
     Ok(format!("Screenshot saved to {}", save_path))
 }
-
 #[tauri::command]
 async fn record_screen(save_path: String) -> Result<String, String> {
     let device_path = "/sdcard/adb_toolbox_record.mp4";
@@ -446,6 +444,7 @@ pub fn run() {
             search_play_store,
             download_apk,
             execute_stream_pipeline,
+            list_android_files,
             push_file,
             pull_file,
             install_apk,
