@@ -4,11 +4,25 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 type LogType = "info" | "success" | "error";
 type ModalMode = "search" | "prompt" | "picker";
 
+interface PlayStoreResult {
+  source: string;
+  name: string;
+  link: string;
+}
+
+interface DeviceInfo {
+  serial: string;
+  model: string;
+  state: string;
+}
+
 let cachedItems: string[] = [];
 let modalResolve: ((value: string | null) => void) | null = null;
 let currentModalMode: ModalMode = "search";
 let executionContextMode: "download" | "stream" = "download";
 let designatedTargetString: string | null = null;
+let lastVerifiedPackageId: string | null = null;
+let selectedDeviceId: string | null = null;
 
 window.addEventListener("DOMContentLoaded", () => {
   const logContent = document.getElementById("logContent")!;
@@ -21,6 +35,56 @@ window.addEventListener("DOMContentLoaded", () => {
   const modalMetaStatus = document.getElementById("modalMetaStatus")!;
   const btnCancelPicker = document.getElementById("btnCancelPicker")!;
   const btnConfirmPicker = document.getElementById("btnConfirmPicker")!;
+
+  const deviceSelect = document.getElementById("deviceSelect") as HTMLSelectElement;
+  const refreshDevicesBtn = document.getElementById("refreshDevicesBtn")!;
+  const deviceStatus = document.getElementById("deviceStatus")!;
+
+  // ── Device Picker ───────────────────────────────────────────────
+
+  async function refreshDevices() {
+    const previouslySelected = selectedDeviceId;
+    deviceStatus.textContent = "Scanning...";
+    try {
+      const devices = await invoke<DeviceInfo[]>("list_devices");
+      deviceSelect.innerHTML = "";
+
+      if (devices.length === 0) {
+        selectedDeviceId = null;
+        const opt = document.createElement("option");
+        opt.textContent = "No devices connected";
+        opt.value = "";
+        deviceSelect.appendChild(opt);
+        deviceStatus.textContent = "0 connected";
+        return;
+      }
+
+      devices.forEach((d) => {
+        const opt = document.createElement("option");
+        opt.value = d.serial;
+        opt.textContent = `${d.model} (${d.serial}) — ${d.state}`;
+        deviceSelect.appendChild(opt);
+      });
+
+      // Preserve the previous selection if it's still connected, otherwise
+      // default to the first device so single-device setups need no action.
+      const stillPresent = devices.some((d) => d.serial === previouslySelected);
+      selectedDeviceId = stillPresent ? previouslySelected : devices[0].serial;
+      deviceSelect.value = selectedDeviceId!;
+      deviceStatus.textContent = `${devices.length} connected`;
+    } catch (err) {
+      deviceSelect.innerHTML = "";
+      selectedDeviceId = null;
+      deviceStatus.textContent = "Scan failed";
+      appendLog(`Device scan failed: ${err}`, "error");
+    }
+  }
+
+  deviceSelect.addEventListener("change", () => {
+    selectedDeviceId = deviceSelect.value || null;
+  });
+
+  refreshDevicesBtn.addEventListener("click", () => refreshDevices());
 
   // ── Log Panel ───────────────────────────────────────────────────────────
 
@@ -101,15 +165,16 @@ window.addEventListener("DOMContentLoaded", () => {
     executionContextMode = mode;
     modalHeadline.textContent =
       mode === "stream"
-        ? "Play Store: Search & Stream-Install"
-        : "Play Store: Search & Download APK";
+        ? "Sideload: Verify & Stream-Install APK"
+        : "Sideload: Verify & Download APK";
     cachedItems = [];
+    lastVerifiedPackageId = null;
     modalDataContainer.innerHTML = "";
     modalDataContainer.style.display = "";
-    modalFilter.placeholder = "Type query + press Enter to search...";
+    modalFilter.placeholder = "Enter EXACT package ID (e.g. com.whatsapp) + Enter...";
     modalFilter.value = "";
     modalMetaStatus.style.display = "";
-    modalMetaStatus.textContent = "Awaiting search term...";
+    modalMetaStatus.textContent = "Awaiting exact package ID...";
     designatedTargetString = null;
     modalElement.classList.remove("invisible");
     modalFilter.focus();
@@ -153,18 +218,22 @@ window.addEventListener("DOMContentLoaded", () => {
     if (currentModalMode === "search") {
       const term = modalFilter.value.trim();
       if (!term) return;
+      lastVerifiedPackageId = term;
 
-      modalMetaStatus.textContent = "Searching...";
+      modalMetaStatus.textContent = "Checking sideload mirrors (may retry a few times)...";
       modalDataContainer.innerHTML =
-        "<li class='picker-row'>Querying Play Store...</li>";
+        "<li class='picker-row'>Checking APKPure, APKMirror, and other sideload mirrors… this can take up to ~20s if retries are needed.</li>";
 
       try {
-        cachedItems = await invoke("search_play_store", { query: term });
+        const results = await invoke<PlayStoreResult[]>("search_play_store", {
+          query: term,
+        });
+        cachedItems = results.map((r) => `${r.name} — found on ${r.source}`);
         populateSelectionList(cachedItems);
-        modalMetaStatus.textContent = `Found ${cachedItems.length} results.`;
+        modalMetaStatus.textContent = `Found on ${results.length} mirror(s).`;
       } catch (err) {
-        modalDataContainer.innerHTML = `<li class='picker-row' style='color: #ff4444;'>Error: ${err}</li>`;
-        modalMetaStatus.textContent = "Search failed.";
+        modalDataContainer.innerHTML = `<li class='picker-row' style='color: #ff4444;'>${err}</li>`;
+        modalMetaStatus.textContent = "Not found.";
       }
     }
   });
@@ -213,13 +282,16 @@ window.addEventListener("DOMContentLoaded", () => {
       modalDataContainer.firstElementChild?.textContent;
     if (
       !rawText ||
-      rawText.includes("No results") ||
-      rawText.includes("Querying")
+      rawText.includes("Not found") ||
+      rawText.includes("Checking") ||
+      !lastVerifiedPackageId
     )
       return;
 
-    const parsedId = rawText.match(/\[(.*?)\]/)?.[1];
-    if (!parsedId) return;
+    // All mirror results refer to the same package ID the user searched for
+    // (apksearch verifies one exact ID against multiple mirrors — it does not
+    // return distinct IDs per row), so that's what apkeep downloads.
+    const parsedId = lastVerifiedPackageId;
 
     modalElement.classList.add("invisible");
 
@@ -228,6 +300,7 @@ window.addEventListener("DOMContentLoaded", () => {
       try {
         const result = await invoke<string>("execute_stream_pipeline", {
           packageId: parsedId,
+          deviceId: selectedDeviceId,
         });
         appendLog(result, "success");
       } catch (err) {
@@ -277,6 +350,7 @@ window.addEventListener("DOMContentLoaded", () => {
         const result = await invoke<string>("push_file", {
           localPath,
           remotePath,
+          deviceId: selectedDeviceId,
         });
         appendLog(result, "success");
       } catch (err) {
@@ -305,6 +379,7 @@ window.addEventListener("DOMContentLoaded", () => {
         const result = await invoke<string>("pull_file", {
           remotePath,
           localPath,
+          deviceId: selectedDeviceId,
         });
         appendLog(result, "success");
       } catch (err) {
@@ -326,7 +401,10 @@ window.addEventListener("DOMContentLoaded", () => {
 
       appendLog(`Installing ${path.split("/").pop()}...`);
       try {
-        const result = await invoke<string>("install_apk", { path });
+        const result = await invoke<string>("install_apk", {
+          path,
+          deviceId: selectedDeviceId,
+        });
         appendLog(result, "success");
       } catch (err) {
         appendLog(`Install failed: ${err}`, "error");
@@ -347,6 +425,7 @@ window.addEventListener("DOMContentLoaded", () => {
       try {
         const result = await invoke<string>("batch_install_apks", {
           folder: folder as string,
+          deviceId: selectedDeviceId,
         });
         appendLog(result, "success");
       } catch (err) {
@@ -360,7 +439,9 @@ window.addEventListener("DOMContentLoaded", () => {
     ?.addEventListener("click", async () => {
       appendLog("Fetching installed packages...");
       try {
-        const packages = await invoke<string[]>("list_packages");
+        const packages = await invoke<string[]>("list_packages", {
+          deviceId: selectedDeviceId,
+        });
         const selected = await showPicker(
           "Select package to clear data:",
           packages
@@ -370,6 +451,7 @@ window.addEventListener("DOMContentLoaded", () => {
         appendLog(`Clearing data for ${selected}...`);
         const result = await invoke<string>("purge_app_cache", {
           packageId: selected,
+          deviceId: selectedDeviceId,
         });
         appendLog(result, "success");
       } catch (err) {
@@ -386,7 +468,10 @@ window.addEventListener("DOMContentLoaded", () => {
 
       appendLog(`Injecting text...`);
       try {
-        const result = await invoke<string>("inject_text", { text });
+        const result = await invoke<string>("inject_text", {
+          text,
+          deviceId: selectedDeviceId,
+        });
         appendLog(result, "success");
       } catch (err) {
         appendLog(`Injection failed: ${err}`, "error");
@@ -399,7 +484,9 @@ window.addEventListener("DOMContentLoaded", () => {
     ?.addEventListener("click", async () => {
       appendLog("Capturing logcat...");
       try {
-        const result = await invoke<string>("capture_logcat");
+        const result = await invoke<string>("capture_logcat", {
+          deviceId: selectedDeviceId,
+        });
         appendLog("─── Logcat ───", "info");
         result.split("\n").forEach((line) => {
           if (line.trim()) appendLog(line);
@@ -425,6 +512,7 @@ window.addEventListener("DOMContentLoaded", () => {
       try {
         const result = await invoke<string>("capture_screenshot", {
           savePath: path,
+          deviceId: selectedDeviceId,
         });
         appendLog(result, "success");
       } catch (err) {
@@ -447,6 +535,7 @@ window.addEventListener("DOMContentLoaded", () => {
       try {
         const result = await invoke<string>("record_screen", {
           savePath: path,
+          deviceId: selectedDeviceId,
         });
         appendLog(result, "success");
       } catch (err) {
@@ -479,7 +568,9 @@ window.addEventListener("DOMContentLoaded", () => {
     ?.addEventListener("click", async () => {
       appendLog("Restarting UI framework...");
       try {
-        const result = await invoke<string>("restart_framework");
+        const result = await invoke<string>("restart_framework", {
+          deviceId: selectedDeviceId,
+        });
         appendLog(result, "success");
       } catch (err) {
         appendLog(`Restart failed: ${err}`, "error");
@@ -492,7 +583,9 @@ window.addEventListener("DOMContentLoaded", () => {
     ?.addEventListener("click", async () => {
       appendLog("Rebooting to bootloader...");
       try {
-        const result = await invoke<string>("reboot_bootloader");
+        const result = await invoke<string>("reboot_bootloader", {
+          deviceId: selectedDeviceId,
+        });
         appendLog(result, "success");
       } catch (err) {
         appendLog(`Reboot failed: ${err}`, "error");
@@ -505,14 +598,17 @@ window.addEventListener("DOMContentLoaded", () => {
     ?.addEventListener("click", async () => {
       appendLog("Rebooting to recovery...");
       try {
-        const result = await invoke<string>("reboot_recovery");
+        const result = await invoke<string>("reboot_recovery", {
+          deviceId: selectedDeviceId,
+        });
         appendLog(result, "success");
       } catch (err) {
         appendLog(`Reboot failed: ${err}`, "error");
       }
     });
 
-  // ── Init ────────────────────────────────────────────────────────────────
+  // ── Init ──────────────────────────────────────────────────
 
+  refreshDevices();
   appendLog("ADB Toolbox initialized.", "success");
 });

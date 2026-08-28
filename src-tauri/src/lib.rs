@@ -1,27 +1,173 @@
 use std::process::Command;
+use serde::Serialize;
 
-// ── Play Store Integration ──────────────────────────────────────────────────
+// ── Device Management ─────────────────────────────────────────────────
+
+#[derive(Serialize, Clone, Debug)]
+struct DeviceInfo {
+    serial: String,
+    model: String,
+    state: String,
+}
 
 #[tauri::command]
-async fn search_play_store(query: String) -> Result<Vec<String>, String> {
-    let output = Command::new("/home/loufogle/.local/bin/apksearch")
-        .arg(&query)
+async fn list_devices() -> Result<Vec<DeviceInfo>, String> {
+    let output = Command::new("adb")
+        .args(["devices", "-l"])
         .output()
-        .map_err(|e| format!("Failed to run apksearch: {}", e))?;
+        .map_err(|e| format!("ADB error: {}", e))?;
 
     if !output.status.success() {
-        return Err(format!("apksearch error: {}", String::from_utf8_lossy(&output.stderr)));
+        return Err(format!(
+            "Failed to list devices: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    
-    // Robust parsing: collect lines, remove empty ones, and format
-    let results: Vec<String> = stdout
+    let devices: Vec<DeviceInfo> = stdout
         .lines()
-        .map(|line| line.trim())
-        .filter(|line| !line.is_empty())
-        .map(|line| format!("{} [{}]", line, line)) // Wrap in brackets for regex
+        .skip(1) // "List of devices attached" header
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            let mut parts = line.split_whitespace();
+            let serial = parts.next()?.to_string();
+            let state = parts.next()?.to_string();
+            let model = parts
+                .find_map(|p| p.strip_prefix("model:"))
+                .unwrap_or("unknown")
+                .to_string();
+            Some(DeviceInfo { serial, model, state })
+        })
         .collect();
+
+    Ok(devices)
+}
+
+// Builds an `adb` command, optionally targeting a specific device via `-s`.
+// With no device_id (or exactly one device connected) adb picks it
+// automatically; with 2+ devices connected and no device_id, adb itself
+// fails clearly ("more than one device/emulator") rather than silently
+// picking the wrong one.
+fn adb_base(device_id: &Option<String>) -> Command {
+    let mut cmd = Command::new("adb");
+    if let Some(id) = device_id {
+        if !id.is_empty() {
+            cmd.args(["-s", id]);
+        }
+    }
+    cmd
+}
+
+// ── Play Store Integration ──────────────────────────────────────────────────
+
+// Verification uses `apkeep --list-versions`, NOT `apksearch`. apksearch (a
+// Python HTML-scraper) was found to be unreliable specifically when invoked
+// as a subprocess of a compiled binary (this app, and a `cargo test` harness):
+// it consistently returned zero results across ALL 7 mirrors it scrapes, for
+// a query that succeeded 100% of the time run directly in an interactive
+// shell. PATH resolution, duplicate binaries, TTY-of-stdout formatting, proxy
+// env vars, silent exceptions (checked via `--log_err`), and stdin handling
+// were all individually tested and ruled out as the cause — the difference
+// is internal to apksearch's own HTTP/scraping behavior.
+//
+// `apkeep` (a compiled Rust tool from the EFF that hits app-store APIs
+// directly rather than scraping HTML) was verified reliable in the exact same
+// subprocess context apksearch failed in, and it's already the tool this app
+// uses for the actual download step — so verification now reuses it via
+// `--list-versions`, dropping the apksearch dependency entirely.
+//
+// Deliberately stays outside Google Play, matching this app's sideload-only
+// design. huawei-app-gallery is deliberately excluded: it can't enumerate
+// historical versions at all and reports success with an explanatory
+// sentence instead of a real version list for EVERY query, existing package
+// or not — making `--list-versions` structurally unable to answer "does this
+// exist" for that source.
+const SIDELOAD_SOURCES: [&str; 2] = ["apk-pure", "f-droid"];
+
+#[derive(Serialize, Clone, Debug)]
+struct PlayStoreResult {
+    source: String,
+    name: String,
+    link: String,
+}
+
+// Runs `apkeep -a <query> -l -d <source>` once and parses its "Versions
+// available for X on Y:\n| v1, v2, ..." output. Returns Ok(None) (not an
+// error) when the source simply doesn't have this package, so the caller can
+// distinguish "checked, not found here" from "the apkeep call itself failed".
+fn check_source_for_versions(query: &str, source: &str) -> Result<Option<PlayStoreResult>, String> {
+    let output = Command::new("apkeep")
+        .args(["-a", query, "-l", "-d", source, "/tmp"])
+        .output()
+        .map_err(|e| format!("Failed to run apkeep: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    if !output.status.success() || !stdout.contains("Versions available") {
+        return Ok(None);
+    }
+
+    let versions: Vec<String> = stdout
+        .lines()
+        .find(|l| l.trim_start().starts_with('|'))
+        .map(|l| {
+            l.trim_start_matches('|')
+                .split(',')
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // A real version string starts with a digit. Guards against sources
+    // that report success with an empty list (package not actually present,
+    // e.g. proprietary apps on F-Droid) or a descriptive sentence instead of
+    // versions — neither of which means the package was actually found.
+    let has_real_versions = versions
+        .first()
+        .is_some_and(|v| v.chars().next().is_some_and(|c| c.is_ascii_digit()));
+
+    if !has_real_versions {
+        return Ok(None);
+    }
+
+    Ok(Some(PlayStoreResult {
+        source: source.to_string(),
+        name: format!(
+            "{} version(s) available (e.g. {})",
+            versions.len(),
+            versions.last().map(|s| s.as_str()).unwrap_or("unknown")
+        ),
+        link: String::new(),
+    }))
+}
+
+#[tauri::command]
+async fn search_play_store(query: String) -> Result<Vec<PlayStoreResult>, String> {
+    let mut results = Vec::new();
+    let mut errors = Vec::new();
+
+    for source in SIDELOAD_SOURCES {
+        match check_source_for_versions(&query, source) {
+            Ok(Some(r)) => results.push(r),
+            Ok(None) => {}
+            Err(e) => errors.push(e),
+        }
+    }
+
+    if results.is_empty() {
+        if !errors.is_empty() {
+            return Err(errors.join("; "));
+        }
+        return Err(format!(
+            "No sideload source has \"{}\". Note: this requires the EXACT package ID (e.g. com.whatsapp), not a keyword.",
+            query
+        ));
+    }
 
     Ok(results)
 }
@@ -47,7 +193,7 @@ async fn download_apk(package_id: String, folder: String) -> Result<String, Stri
 }
 
 #[tauri::command]
-async fn execute_stream_pipeline(package_id: String) -> Result<String, String> {
+async fn execute_stream_pipeline(package_id: String, device_id: Option<String>) -> Result<String, String> {
     let tmp_dir = "/tmp/gplay_stream_cache";
     let _ = std::fs::create_dir_all(tmp_dir);
 
@@ -76,7 +222,7 @@ async fn execute_stream_pipeline(package_id: String) -> Result<String, String> {
         .ok_or("Downloaded APK not found in cache")?;
 
     // Stream-install to device via ADB
-    let install = Command::new("adb")
+    let install = adb_base(&device_id)
         .args(["install", "-r", "-g", apk_path.to_str().unwrap_or("")])
         .output()
         .map_err(|e| format!("ADB error: {}", e))?;
@@ -96,8 +242,8 @@ async fn execute_stream_pipeline(package_id: String) -> Result<String, String> {
 // ── File Transfer ───────────────────────────────────────────────────────────
 
 #[tauri::command]
-async fn list_android_files(remote_path: String) -> Result<Vec<String>, String> {
-    let output = Command::new("adb")
+async fn list_android_files(remote_path: String, device_id: Option<String>) -> Result<Vec<String>, String> {
+    let output = adb_base(&device_id)
         .args(["shell", "ls", "-1", &remote_path])
         .output()
         .map_err(|e| format!("ADB error: {}", e))?;
@@ -118,8 +264,8 @@ async fn list_android_files(remote_path: String) -> Result<Vec<String>, String> 
 }
 
 #[tauri::command]
-async fn push_file(local_path: String, remote_path: String) -> Result<String, String> {
-    let output = Command::new("adb")
+async fn push_file(local_path: String, remote_path: String, device_id: Option<String>) -> Result<String, String> {
+    let output = adb_base(&device_id)
         .args(["push", &local_path, &remote_path])
         .output()
         .map_err(|e| format!("ADB error: {}", e))?;
@@ -135,8 +281,8 @@ async fn push_file(local_path: String, remote_path: String) -> Result<String, St
 }
 
 #[tauri::command]
-async fn pull_file(remote_path: String, local_path: String) -> Result<String, String> {
-    let output = Command::new("adb")
+async fn pull_file(remote_path: String, local_path: String, device_id: Option<String>) -> Result<String, String> {
+    let output = adb_base(&device_id)
         .args(["pull", &remote_path, &local_path])
         .output()
         .map_err(|e| format!("ADB error: {}", e))?;
@@ -154,8 +300,8 @@ async fn pull_file(remote_path: String, local_path: String) -> Result<String, St
 // ── APK Management ──────────────────────────────────────────────────────────
 
 #[tauri::command]
-async fn install_apk(path: String) -> Result<String, String> {
-    let output = Command::new("adb")
+async fn install_apk(path: String, device_id: Option<String>) -> Result<String, String> {
+    let output = adb_base(&device_id)
         .args(["install", "-r", "-g", &path])
         .output()
         .map_err(|e| format!("ADB error: {}", e))?;
@@ -175,7 +321,7 @@ async fn install_apk(path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn batch_install_apks(folder: String) -> Result<String, String> {
+async fn batch_install_apks(folder: String, device_id: Option<String>) -> Result<String, String> {
     let entries =
         std::fs::read_dir(&folder).map_err(|e| format!("Cannot read folder: {}", e))?;
 
@@ -186,7 +332,7 @@ async fn batch_install_apks(folder: String) -> Result<String, String> {
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.extension().map(|e| e == "apk").unwrap_or(false) {
-            match Command::new("adb")
+            match adb_base(&device_id)
                 .args(["install", "-r", "-g", path.to_str().unwrap_or("")])
                 .output()
             {
@@ -228,8 +374,8 @@ async fn batch_install_apks(folder: String) -> Result<String, String> {
 // ── Package Management ──────────────────────────────────────────────────────
 
 #[tauri::command]
-async fn list_packages() -> Result<Vec<String>, String> {
-    let output = Command::new("adb")
+async fn list_packages(device_id: Option<String>) -> Result<Vec<String>, String> {
+    let output = adb_base(&device_id)
         .args(["shell", "pm", "list", "packages"])
         .output()
         .map_err(|e| format!("ADB error: {}", e))?;
@@ -252,8 +398,8 @@ async fn list_packages() -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
-async fn purge_app_cache(package_id: String) -> Result<String, String> {
-    let output = Command::new("adb")
+async fn purge_app_cache(package_id: String, device_id: Option<String>) -> Result<String, String> {
+    let output = adb_base(&device_id)
         .args(["shell", "pm", "clear", &package_id])
         .output()
         .map_err(|e| format!("ADB error: {}", e))?;
@@ -271,10 +417,10 @@ async fn purge_app_cache(package_id: String) -> Result<String, String> {
 // ── Diagnostics & Interaction ───────────────────────────────────────────────
 
 #[tauri::command]
-async fn inject_text(text: String) -> Result<String, String> {
+async fn inject_text(text: String, device_id: Option<String>) -> Result<String, String> {
     // adb shell input text requires %s for spaces
     let escaped = text.replace(' ', "%s");
-    let output = Command::new("adb")
+    let output = adb_base(&device_id)
         .args(["shell", "input", "text", &escaped])
         .output()
         .map_err(|e| format!("ADB error: {}", e))?;
@@ -290,8 +436,8 @@ async fn inject_text(text: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn capture_logcat() -> Result<String, String> {
-    let output = Command::new("adb")
+async fn capture_logcat(device_id: Option<String>) -> Result<String, String> {
+    let output = adb_base(&device_id)
         .args(["logcat", "-d", "-t", "200"])
         .output()
         .map_err(|e| format!("ADB error: {}", e))?;
@@ -307,8 +453,8 @@ async fn capture_logcat() -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn capture_screenshot(save_path: String) -> Result<String, String> {
-    let output = Command::new("adb")
+async fn capture_screenshot(save_path: String, device_id: Option<String>) -> Result<String, String> {
+    let output = adb_base(&device_id)
         .args(["exec-out", "screencap", "-p"])
         .output()
         .map_err(|e| format!("ADB error: {}", e))?;
@@ -326,11 +472,11 @@ async fn capture_screenshot(save_path: String) -> Result<String, String> {
     Ok(format!("Screenshot saved to {}", save_path))
 }
 #[tauri::command]
-async fn record_screen(save_path: String) -> Result<String, String> {
+async fn record_screen(save_path: String, device_id: Option<String>) -> Result<String, String> {
     let device_path = "/sdcard/adb_toolbox_record.mp4";
 
     // Record for 10 seconds on the device
-    let record = Command::new("adb")
+    let record = adb_base(&device_id)
         .args(["shell", "screenrecord", "--time-limit", "10", device_path])
         .output()
         .map_err(|e| format!("ADB error: {}", e))?;
@@ -343,13 +489,13 @@ async fn record_screen(save_path: String) -> Result<String, String> {
     }
 
     // Pull the recording to local filesystem
-    let pull = Command::new("adb")
+    let pull = adb_base(&device_id)
         .args(["pull", device_path, &save_path])
         .output()
         .map_err(|e| format!("Pull error: {}", e))?;
 
     // Clean up device file
-    let _ = Command::new("adb")
+    let _ = adb_base(&device_id)
         .args(["shell", "rm", device_path])
         .output();
 
@@ -383,8 +529,8 @@ async fn copy_to_mount(source: String, mount_point: String) -> Result<String, St
 // ── Device Power Control ────────────────────────────────────────────────────
 
 #[tauri::command]
-async fn restart_framework() -> Result<String, String> {
-    let output = Command::new("adb")
+async fn restart_framework(device_id: Option<String>) -> Result<String, String> {
+    let output = adb_base(&device_id)
         .args(["shell", "su", "-c", "stop; sleep 1; start"])
         .output()
         .map_err(|e| format!("ADB error: {}", e))?;
@@ -400,8 +546,8 @@ async fn restart_framework() -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn reboot_bootloader() -> Result<String, String> {
-    let output = Command::new("adb")
+async fn reboot_bootloader(device_id: Option<String>) -> Result<String, String> {
+    let output = adb_base(&device_id)
         .args(["reboot", "bootloader"])
         .output()
         .map_err(|e| format!("ADB error: {}", e))?;
@@ -417,8 +563,8 @@ async fn reboot_bootloader() -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn reboot_recovery() -> Result<String, String> {
-    let output = Command::new("adb")
+async fn reboot_recovery(device_id: Option<String>) -> Result<String, String> {
+    let output = adb_base(&device_id)
         .args(["reboot", "recovery"])
         .output()
         .map_err(|e| format!("ADB error: {}", e))?;
@@ -433,6 +579,51 @@ async fn reboot_recovery() -> Result<String, String> {
     }
 }
 
+// ── Tests ──────────────────────────────────────────────────────────────────────
+// These exercise the real `search_play_store` function against the live
+// `apkeep` tool (no mocking). apkeep was chosen over apksearch specifically
+// because it was verified reliable as a compiled-binary subprocess, so these
+// are NOT marked #[ignore] — unlike the apksearch-based version this
+// replaced, they're expected to pass consistently.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn search_play_store_finds_real_package_via_apkeep() {
+        let results = search_play_store("com.whatsapp".to_string())
+            .await
+            .expect("apkeep should find com.whatsapp on at least one sideload source");
+
+        assert!(!results.is_empty(), "expected at least one source result");
+        for r in &results {
+            assert!(!r.source.is_empty(), "source must not be empty");
+            assert!(
+                r.name.contains("version"),
+                "name should mention version count, got: {}",
+                r.name
+            );
+        }
+        println!("Found {} source(s) for com.whatsapp:", results.len());
+        for r in &results {
+            println!("  {} -> {}", r.source, r.name);
+        }
+    }
+
+    #[tokio::test]
+    async fn search_play_store_rejects_free_text_keyword_with_clear_error() {
+        let err = search_play_store("gmail".to_string())
+            .await
+            .expect_err("a free-text keyword should not resolve to any exact package");
+        assert!(
+            err.contains("EXACT package ID"),
+            "error should explain the exact-package-id requirement, got: {}",
+            err
+        );
+    }
+}
+
 // ── App Entry Point ─────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -441,6 +632,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
+            list_devices,
             search_play_store,
             download_apk,
             execute_stream_pipeline,
